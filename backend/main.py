@@ -1,41 +1,34 @@
+
 import os
+import json
+import sqlite3
 from pathlib import Path
+from datetime import datetime, timezone
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import (
-    FastAPI,
-    UploadFile,
-    File,
-    Form,
-    HTTPException
-)
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
 
 
 # --------------------------------------------------
-# ENVIRONMENT CONFIGURATION
+# CONFIGURATION
 # --------------------------------------------------
 
-# Load VOX7/.env
-ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+BASE_DIR = Path(__file__).resolve().parent.parent
+ENV_PATH = BASE_DIR / ".env"
+DB_PATH = BASE_DIR / "backend" / "vox7_history.db"
+
 load_dotenv(ENV_PATH)
 
 GNANI_API_KEY = os.getenv("GNANI_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-
-# --------------------------------------------------
-# API ENDPOINTS
-# --------------------------------------------------
-
-# Gnani APIs
 STT_URL = "https://api.vachana.ai/stt/v3"
 TTS_URL = "https://api.vachana.ai/api/v1/tts/inference"
 
-# Gemini API
 GEMINI_URL = (
     "https://generativelanguage.googleapis.com/"
     "v1beta/models/gemini-3.5-flash-lite:generateContent"
@@ -43,21 +36,53 @@ GEMINI_URL = (
 
 
 # --------------------------------------------------
-# FASTAPI APPLICATION
+# DATABASE
+# --------------------------------------------------
+
+def get_connection():
+    connection = sqlite3.connect(DB_PATH)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def initialize_database():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    with get_connection() as connection:
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS conversations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                transcript TEXT NOT NULL,
+                answer TEXT NOT NULL,
+                language TEXT DEFAULT 'indic-auto',
+                events TEXT DEFAULT '[]',
+                created_at TEXT NOT NULL
+            )
+        """)
+
+
+initialize_database()
+
+
+# --------------------------------------------------
+# APPLICATION
 # --------------------------------------------------
 
 app = FastAPI(
     title="VOX7 API",
     description="Multilingual Voice Intelligence Platform",
-    version="2.0.0"
+    version="3.0.0"
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"]
 )
 
 
@@ -67,10 +92,17 @@ app.add_middleware(
 
 class ChatRequest(BaseModel):
     question: str
+    language: str = "en-IN"
+
+
+class HistoryRequest(BaseModel):
+    transcript: str
+    answer: str
+    language: str = "indic-auto"
 
 
 # --------------------------------------------------
-# API KEY VALIDATION
+# API KEY HELPERS
 # --------------------------------------------------
 
 def get_api_key():
@@ -79,7 +111,6 @@ def get_api_key():
             status_code=500,
             detail="GNANI_API_KEY is missing from .env"
         )
-
     return GNANI_API_KEY
 
 
@@ -89,12 +120,11 @@ def get_gemini_key():
             status_code=500,
             detail="GEMINI_API_KEY is missing from .env"
         )
-
     return GEMINI_API_KEY
 
 
 # --------------------------------------------------
-# HOME
+# HOME AND HEALTH
 # --------------------------------------------------
 
 @app.get("/")
@@ -102,13 +132,9 @@ async def home():
     return {
         "message": "Welcome to VOX7!",
         "status": "running",
-        "version": "2.0.0"
+        "version": "3.0.0"
     }
 
-
-# --------------------------------------------------
-# HEALTH CHECK
-# --------------------------------------------------
 
 @app.get("/health")
 async def health():
@@ -117,7 +143,8 @@ async def health():
         "project": "VOX7",
         "speech_model": "Prisma v3.0",
         "voice_model": "Timbre v2.5",
-        "conversation_model": "Gemini 3.8 Flash"
+        "conversation_model": "Gemini 3.5 Flash-Lite",
+        "history": "SQLite enabled"
     }
 
 
@@ -131,26 +158,17 @@ async def transcribe(
     language_code: str = Form("indic-auto")
 ):
     api_key = get_api_key()
-
     audio_data = await audio.read()
 
     if not audio_data:
-        raise HTTPException(
-            status_code=400,
-            detail="Audio file is empty"
-        )
+        raise HTTPException(400, "Audio file is empty")
 
     if len(audio_data) > 15 * 1024 * 1024:
-        raise HTTPException(
-            status_code=413,
-            detail="Audio file is too large"
-        )
+        raise HTTPException(413, "Audio file is too large")
 
     filename = audio.filename or "recording.wav"
 
-    headers = {
-        "X-API-Key-ID": api_key
-    }
+    headers = {"X-API-Key-ID": api_key}
 
     files = {
         "audio_file": (
@@ -177,23 +195,30 @@ async def transcribe(
 
         if result.status_code != 200:
             raise HTTPException(
-                status_code=result.status_code,
-                detail="Gnani transcription failed: "
-                + result.text[:500]
+                result.status_code,
+                "Gnani transcription failed: " + result.text[:500]
             )
 
-        return result.json()
+        transcription = result.json()
+        # Prisma v3 returns detected_language_code when indic-auto is used.
+        supported_languages = {
+            "en-IN", "hi-IN", "bn-IN", "mr-IN", "gu-IN",
+            "pa-IN", "kn-IN", "te-IN", "ta-IN", "ml-IN"
+        }
+        detected_language = (
+            transcription.get("detected_language_code")
+            or transcription.get("language_code")
+            or ("en-IN" if language_code == "indic-auto" else language_code)
+        )
+        if detected_language not in supported_languages:
+            detected_language = "en-IN"
+        if isinstance(transcription, dict):
+            transcription["detected_language_code"] = detected_language
+        return transcription
 
     except httpx.RequestError as exc:
-        print(
-            f"Gnani STT connection error: "
-            f"{type(exc).__name__}: {exc}"
-        )
-
-        raise HTTPException(
-            status_code=502,
-            detail="Could not connect to Gnani STT"
-        )
+        print(f"Gnani STT connection error: {exc}")
+        raise HTTPException(502, "Could not connect to Gnani STT")
 
 
 # --------------------------------------------------
@@ -202,22 +227,34 @@ async def transcribe(
 
 @app.post("/api/chat")
 async def chat(request: ChatRequest):
-
     api_key = get_gemini_key()
-
     question = request.question.strip()
+    language_names = {
+        "en-IN": "English",
+        "hi-IN": "Hindi",
+        "bn-IN": "Bengali",
+        "mr-IN": "Marathi",
+        "gu-IN": "Gujarati",
+        "pa-IN": "Punjabi",
+        "kn-IN": "Kannada",
+        "te-IN": "Telugu",
+        "ta-IN": "Tamil",
+        "ml-IN": "Malayalam",
+    }
+    requested_language = request.language.strip()
+    supported_languages = {
+        "en-IN", "hi-IN", "bn-IN", "mr-IN", "gu-IN",
+        "pa-IN", "kn-IN", "te-IN", "ta-IN", "ml-IN"
+    }
+    if requested_language not in supported_languages:
+        requested_language = "en-IN"
+    response_language = language_names.get(requested_language, "English")
 
     if not question:
-        raise HTTPException(
-            status_code=400,
-            detail="Question cannot be empty"
-        )
+        raise HTTPException(400, "Question cannot be empty")
 
     if len(question) > 10000:
-        raise HTTPException(
-            status_code=400,
-            detail="Question is too long"
-        )
+        raise HTTPException(400, "Question is too long")
 
     headers = {
         "x-goog-api-key": api_key,
@@ -230,25 +267,29 @@ async def chat(request: ChatRequest):
                 "text": (
                     "You are VOX7, a friendly multilingual AI "
                     "voice companion created for the Great Indian "
-                    "AI Internship Challenge. "
-                    "Understand the user's question and provide "
-                    "helpful, accurate and natural responses. "
-                    "Respond in the language used by the user "
-                    "whenever possible. "
-                    "Keep responses conversational and easy to "
-                    "understand when spoken aloud."
+                    "AI Internship Challenge. Understand the user's "
+                    "question and provide helpful, accurate and "
+                    "natural responses. The detected speech language is "
+                    f"{response_language} ({requested_language}). "
+                    "Respond in that language. Preserve natural code-mixing "
+                    "when the user mixes languages. Do not switch to English "
+                    "unless the user does. Keep responses conversational "
+                    "and easy to understand when spoken aloud. "
+                    "If the user asks you to sing, write a short original "
+                    "song or playful lyrics in the requested language. "
+                    "Never copy existing copyrighted song lyrics. "
+                    "Use emojis naturally when they add warmth, emotion, "
+                    "or clarity; support Unicode emojis in your replies."
                 )
             }]
         },
         "contents": [{
             "role": "user",
-            "parts": [{
-                "text": question
-            }]
+            "parts": [{"text": question}]
         }],
         "generationConfig": {
-    "maxOutputTokens": 400
-}
+            "maxOutputTokens": 400
+        }
     }
 
     try:
@@ -264,22 +305,16 @@ async def chat(request: ChatRequest):
                 f"Gemini API error: "
                 f"{result.status_code}: {result.text[:500]}"
             )
-
             raise HTTPException(
-                status_code=result.status_code,
-                detail="AI generation failed: "
-                + result.text[:500]
+                result.status_code,
+                "AI generation failed: " + result.text[:500]
             )
 
         data = result.json()
-
         candidates = data.get("candidates", [])
 
         if not candidates:
-            raise HTTPException(
-                status_code=502,
-                detail="AI did not return an answer"
-            )
+            raise HTTPException(502, "AI did not return an answer")
 
         answer = "".join(
             part.get("text", "")
@@ -289,29 +324,22 @@ async def chat(request: ChatRequest):
         ).strip()
 
         if not answer:
-            raise HTTPException(
-                status_code=502,
-                detail="AI returned an empty answer"
-            )
+            raise HTTPException(502, "AI returned an empty answer")
 
         return {
             "success": True,
             "question": question,
             "answer": answer,
-            "model": "Gemini 3.8 Flash",
+            "language": requested_language,
+            "model": "Gemini 3.5 Flash-Lite",
             "project": "VOX7"
         }
 
     except httpx.RequestError as exc:
-        print(
-            f"Gemini connection error: "
-            f"{type(exc).__name__}: {exc}"
-        )
-
+        print(f"Gemini connection error: {exc}")
         raise HTTPException(
-            status_code=502,
-            detail="Could not connect to AI service. "
-            "Check backend terminal."
+            502,
+            "Could not connect to AI service. Check backend terminal."
         )
 
 
@@ -327,17 +355,18 @@ async def speak(
 ):
     api_key = get_api_key()
 
+    supported_languages = {
+        "en-IN", "hi-IN", "bn-IN", "mr-IN", "gu-IN",
+        "pa-IN", "kn-IN", "te-IN", "ta-IN", "ml-IN"
+    }
+    if language not in supported_languages:
+        language = "en-IN"
+
     if not text.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Text cannot be empty"
-        )
+        raise HTTPException(400, "Text cannot be empty")
 
     if len(text) > 2000:
-        raise HTTPException(
-            status_code=400,
-            detail="Text is too long"
-        )
+        raise HTTPException(400, "Text is too long")
 
     payload = {
         "text": text,
@@ -370,9 +399,8 @@ async def speak(
 
         if result.status_code != 200:
             raise HTTPException(
-                status_code=result.status_code,
-                detail="Gnani speech generation failed: "
-                + result.text[:500]
+                result.status_code,
+                "Gnani speech generation failed: " + result.text[:500]
             )
 
         return Response(
@@ -380,22 +408,105 @@ async def speak(
             media_type="audio/wav",
             headers={
                 "Content-Disposition":
-                'inline; filename="vox7-speech.wav"'
+                    'inline; filename="vox7-speech.wav"'
             }
         )
 
     except httpx.RequestError as exc:
-        print(
-            f"Gnani TTS connection error: "
-            f"{type(exc).__name__}: {exc}"
-        )
+        print(f"Gnani TTS connection error: {exc}")
+        raise HTTPException(502, "Could not connect to Gnani TTS")
 
+
+# --------------------------------------------------
+# CONVERSATION HISTORY
+# --------------------------------------------------
+
+@app.post("/api/history")
+async def save_history(request: HistoryRequest):
+    transcript = request.transcript.strip()
+    answer = request.answer.strip()
+
+    if not transcript or not answer:
         raise HTTPException(
-            status_code=502,
-            detail="Could not connect to Gnani TTS"
+            400,
+            "Transcript and answer are required"
         )
 
+    now = datetime.now(timezone.utc).isoformat()
 
-# --------------------------------------------------
-# END OF VOX7 API
-# --------------------------------------------------
+    events = [
+        {"label": "Voice recording completed", "time": now},
+        {"label": "Prisma speech transcription completed", "time": now},
+        {"label": "Gemini generated a response", "time": now},
+        {"label": "VOX7 conversation saved", "time": now}
+    ]
+
+    with get_connection() as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO conversations
+            (transcript, answer, language, events, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                transcript,
+                answer,
+                request.language,
+                json.dumps(events),
+                now
+            )
+        )
+
+        conversation_id = cursor.lastrowid
+
+    return {
+        "success": True,
+        "id": conversation_id,
+        "created_at": now
+    }
+
+
+@app.get("/api/history")
+async def get_history():
+    with get_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT * FROM conversations
+            ORDER BY id DESC
+            """
+        ).fetchall()
+
+    conversations = []
+
+    for row in rows:
+        item = dict(row)
+        item["events"] = json.loads(item["events"] or "[]")
+        conversations.append(item)
+
+    return {
+        "success": True,
+        "conversations": conversations,
+        "total": len(conversations)
+    }
+
+
+@app.delete("/api/history/{conversation_id}")
+async def delete_history(conversation_id: int):
+    with get_connection() as connection:
+        cursor = connection.execute(
+            "DELETE FROM conversations WHERE id = ?",
+            (conversation_id,)
+        )
+
+        if cursor.rowcount == 0:
+            raise HTTPException(404, "Conversation not found")
+
+    return {"success": True, "message": "Conversation deleted"}
+
+
+@app.delete("/api/history")
+async def clear_history():
+    with get_connection() as connection:
+        connection.execute("DELETE FROM conversations")
+
+    return {"success": True, "message": "History cleared"}

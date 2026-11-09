@@ -1,8 +1,8 @@
 
 :root {
-  font-family: Inter, system-ui, sans-serif;
-  color: #f8fafc;
-  background: #080f20;
+  font-family: 'DM Sans', system-ui, sans-serif;
+  color: #252b32;
+  background: #f7f8fa;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
 }
@@ -13,7 +13,9 @@
   box-sizing: border-box;
 }
 
-html, body, #root {
+html,
+body,
+#root {
   min-width: 320px;
   min-height: 100%;
   width: 100%;
@@ -21,10 +23,11 @@ html, body, #root {
 
 body {
   min-height: 100vh;
-  color: #f8fafc;
-  background: #080f20;
+  color: #252b32;
+  background: #f7f8fa;
 }
 
-button {
+button,
+input {
   font-family: inherit;
 }
